@@ -572,6 +572,578 @@ Full implementation of inline image display:
 
 ---
 
+### 6.1.1 Detailed macOS WebView Implementation Specification
+
+This section provides a comprehensive technical specification for implementing web overlays on macOS.
+
+#### Current macOS View Hierarchy
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  SwiftUI SurfaceWrapper                                                     │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  ZStack (Overlay Composition)                                         │  │
+│  │                                                                       │  │
+│  │  Layer 0:  GeometryReader + SurfaceRepresentable                      │  │
+│  │            └── SurfaceScrollView (NSView)                             │  │
+│  │                └── NSScrollView                                       │  │
+│  │                    └── SurfaceView (NSView with Metal Layer)          │  │
+│  │                                                                       │  │
+│  │  Layer 1:  SurfaceResizeOverlay (size indicator)                      │  │
+│  │  Layer 2:  SurfaceProgressBar (top progress bar)                      │  │
+│  │  Layer 3:  ReadonlyBadge (top-right corner)                           │  │
+│  │  Layer 4:  KeyStateIndicator (draggable key state pill)               │  │
+│  │  Layer 5:  URL Tooltip (bottom-right hover URL)                       │  │
+│  │  Layer 6:  SecureInputOverlay (lock indicator)                        │  │
+│  │  Layer 7:  SurfaceSearchOverlay (draggable search bar)                │  │
+│  │  Layer 8:  BellBorderOverlay (animated border)                        │  │
+│  │  Layer 9:  HighlightOverlay (pulsing glow)                            │  │
+│  │  Layer 10: Error/Unhealthy state overlay                              │  │
+│  │  Layer 11: Unfocused split dimming                                    │  │
+│  │  Layer 12: SurfaceGrabHandle (top drag area)                          │  │
+│  │                                                                       │  │
+│  │  ═══════════════════════════════════════════════════════════════════  │  │
+│  │  NEW: Layer 13: WebOverlayContainer (proposed)                        │  │
+│  │                                                                       │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Key Files:**
+- `macos/Sources/Ghostty/Surface View/SurfaceView.swift` (overlay ZStack, ~1263 lines)
+- `macos/Sources/Ghostty/Surface View/SurfaceView_AppKit.swift` (NSView, ~2291 lines)
+- `macos/Sources/Ghostty/Surface View/SurfaceScrollView.swift` (scroll management, ~396 lines)
+
+#### Coordinate System Conversion
+
+The coordinate conversion pipeline is critical for positioning overlays correctly:
+
+```
+Terminal Coordinates          View Coordinates           Screen Coordinates
+(row, col) grid units    →    (x, y) pixels         →   (x, y) screen pixels
+Origin: top-left             Origin: bottom-left        Origin: varies
++Y: down                     +Y: up (AppKit)            +Y: up
+
+┌─────────────────┐          ┌─────────────────┐        ┌─────────────────┐
+│ (0,0)───────→   │          │        ↑ +Y     │        │ Screen origin   │
+│   │             │          │        │        │        │ (may be non-zero)│
+│   ↓ +Y          │    ──►   │ (0,0)──┼───→ +X │   ──►  │                 │
+│                 │          │        │        │        │                 │
+└─────────────────┘          └─────────────────┘        └─────────────────┘
+```
+
+**Conversion Code Path (from `SurfaceView_AppKit.swift:1851-1906`):**
+
+```swift
+// Step 1: Get pixel coordinates from libghostty (terminal coords → pixels)
+var x: Double = 0    // Pixel X from terminal
+var y: Double = 0    // Pixel Y (top-left origin, +Y down)
+ghostty_surface_ime_point(surface, &x, &y, &width, &height)
+
+// Step 2: Convert to AppKit view coordinates (flip Y axis)
+let viewRect = NSMakeRect(
+    x,                              // X unchanged
+    frame.size.height - y,          // Y flipped: view_y = height - terminal_y
+    width,
+    max(height, cellSize.height)
+)
+
+// Step 3: Convert to window coordinates
+let winRect = self.convert(viewRect, to: nil)
+
+// Step 4: Convert to screen coordinates
+guard let window = self.window else { return winRect }
+return window.convertToScreen(winRect)
+```
+
+#### Proposed Implementation: WebOverlayManager
+
+**New Files to Create:**
+
+```
+macos/Sources/Ghostty/Overlays/
+├── WebOverlay.swift           // WKWebView wrapper
+├── WebOverlayManager.swift    // Manages multiple overlays
+├── WebOverlayConfig.swift     // Configuration/styling
+└── WebOverlayPosition.swift   // Terminal → screen positioning
+```
+
+**Core Data Structures:**
+
+```swift
+// WebOverlay.swift
+import WebKit
+import SwiftUI
+
+/// Configuration for a web overlay
+struct WebOverlayConfig: Identifiable {
+    let id: UUID = UUID()
+
+    /// Anchor point in terminal coordinates
+    var anchorRow: Int
+    var anchorCol: Int
+
+    /// Size in terminal cells (or fixed pixels)
+    enum Size {
+        case cells(rows: Int, cols: Int)
+        case pixels(width: CGFloat, height: CGFloat)
+        case auto  // Size to content
+    }
+    var size: Size
+
+    /// Position relative to anchor
+    enum Anchor {
+        case topLeft, topRight, bottomLeft, bottomRight
+        case above, below  // Tooltip-style
+    }
+    var anchor: Anchor = .below
+
+    /// Content source
+    enum Content {
+        case html(String)
+        case url(URL)
+        case data(Data, mimeType: String)
+    }
+    var content: Content
+
+    /// Behavior options
+    var dismissOnClickOutside: Bool = true
+    var dismissOnEscape: Bool = true
+    var dismissOnScroll: Bool = false
+    var capturesMouse: Bool = true
+    var capturesKeyboard: Bool = false  // Usually keep false for tooltips
+
+    /// Appearance
+    var backgroundColor: NSColor = .clear
+    var cornerRadius: CGFloat = 8
+    var shadow: Bool = true
+}
+
+/// The actual WebView overlay
+class WebOverlayView: NSView {
+    let webView: WKWebView
+    let config: WebOverlayConfig
+    weak var surfaceView: SurfaceView?
+
+    private var observation: NSKeyValueObservation?
+
+    init(config: WebOverlayConfig, surfaceView: SurfaceView) {
+        self.config = config
+        self.surfaceView = surfaceView
+
+        // Configure WKWebView
+        let webConfig = WKWebViewConfiguration()
+        webConfig.preferences.javaScriptEnabled = true
+        // Disable scrolling for tooltip-style overlays
+        webConfig.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")
+
+        self.webView = WKWebView(frame: .zero, configuration: webConfig)
+        self.webView.isOpaque = false
+        self.webView.setValue(false, forKey: "drawsBackground")
+
+        super.init(frame: .zero)
+
+        setupView()
+        loadContent()
+        positionOverlay()
+    }
+
+    private func setupView() {
+        wantsLayer = true
+        layer?.cornerRadius = config.cornerRadius
+        layer?.masksToBounds = true
+
+        if config.shadow {
+            layer?.shadowColor = NSColor.black.cgColor
+            layer?.shadowOpacity = 0.3
+            layer?.shadowOffset = CGSize(width: 0, height: -2)
+            layer?.shadowRadius = 8
+        }
+
+        addSubview(webView)
+        webView.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            webView.topAnchor.constraint(equalTo: topAnchor),
+            webView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            webView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            webView.trailingAnchor.constraint(equalTo: trailingAnchor),
+        ])
+    }
+
+    private func loadContent() {
+        switch config.content {
+        case .html(let html):
+            webView.loadHTMLString(html, baseURL: nil)
+        case .url(let url):
+            webView.load(URLRequest(url: url))
+        case .data(let data, let mimeType):
+            webView.load(data, mimeType: mimeType,
+                        characterEncodingName: "utf-8", baseURL: nil)
+        }
+    }
+
+    /// Position the overlay relative to terminal coordinates
+    func positionOverlay() {
+        guard let surfaceView = surfaceView else { return }
+
+        // Calculate pixel position from terminal coordinates
+        let cellWidth = surfaceView.cellSize.width
+        let cellHeight = surfaceView.cellSize.height
+
+        // Terminal pixel position (top-left origin)
+        let terminalX = CGFloat(config.anchorCol) * cellWidth
+        let terminalY = CGFloat(config.anchorRow) * cellHeight
+
+        // Convert to view coordinates (flip Y)
+        let viewX = terminalX
+        let viewY = surfaceView.frame.height - terminalY
+
+        // Calculate overlay size
+        let overlaySize: CGSize
+        switch config.size {
+        case .cells(let rows, let cols):
+            overlaySize = CGSize(
+                width: CGFloat(cols) * cellWidth,
+                height: CGFloat(rows) * cellHeight
+            )
+        case .pixels(let width, let height):
+            overlaySize = CGSize(width: width, height: height)
+        case .auto:
+            overlaySize = CGSize(width: 300, height: 200) // Default
+        }
+
+        // Apply anchor offset
+        var origin = CGPoint(x: viewX, y: viewY)
+        switch config.anchor {
+        case .topLeft:
+            break // No adjustment
+        case .topRight:
+            origin.x -= overlaySize.width
+        case .bottomLeft:
+            origin.y -= overlaySize.height
+        case .bottomRight:
+            origin.x -= overlaySize.width
+            origin.y -= overlaySize.height
+        case .above:
+            origin.y += cellHeight  // Move up (in flipped coords)
+        case .below:
+            origin.y -= overlaySize.height + cellHeight
+        }
+
+        // Set frame
+        self.frame = NSRect(origin: origin, size: overlaySize)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) not implemented")
+    }
+}
+```
+
+**Manager Class:**
+
+```swift
+// WebOverlayManager.swift
+
+/// Manages all web overlays for a terminal surface
+class WebOverlayManager: ObservableObject {
+    @Published private(set) var overlays: [UUID: WebOverlayView] = [:]
+
+    weak var surfaceView: SurfaceView?
+
+    init(surfaceView: SurfaceView) {
+        self.surfaceView = surfaceView
+
+        // Observe scroll position changes to reposition overlays
+        // (or dismiss if configured)
+        setupScrollObservation()
+    }
+
+    /// Show a new overlay
+    func show(_ config: WebOverlayConfig) -> UUID {
+        guard let surfaceView = surfaceView else { return config.id }
+
+        let overlay = WebOverlayView(config: config, surfaceView: surfaceView)
+        overlays[config.id] = overlay
+
+        // Add to surface view's superview (so it floats above terminal)
+        surfaceView.superview?.addSubview(overlay)
+
+        // Animate in
+        overlay.alphaValue = 0
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.15
+            overlay.animator().alphaValue = 1
+        }
+
+        return config.id
+    }
+
+    /// Dismiss an overlay
+    func dismiss(_ id: UUID, animated: Bool = true) {
+        guard let overlay = overlays[id] else { return }
+
+        if animated {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.15
+                overlay.animator().alphaValue = 0
+            } completionHandler: {
+                overlay.removeFromSuperview()
+                self.overlays.removeValue(forKey: id)
+            }
+        } else {
+            overlay.removeFromSuperview()
+            overlays.removeValue(forKey: id)
+        }
+    }
+
+    /// Dismiss all overlays
+    func dismissAll() {
+        for id in overlays.keys {
+            dismiss(id)
+        }
+    }
+
+    /// Update overlay positions (call on terminal resize/scroll)
+    func repositionAll() {
+        for overlay in overlays.values {
+            overlay.positionOverlay()
+        }
+    }
+
+    private func setupScrollObservation() {
+        // Would observe scrollbar changes from surfaceView
+        // and call repositionAll() or dismissAll() based on config
+    }
+}
+```
+
+**SwiftUI Integration:**
+
+```swift
+// In SurfaceView.swift, add to the ZStack after existing overlays:
+
+struct SurfaceWrapper: View {
+    @ObservedObject var surfaceView: Ghostty.SurfaceView
+    @StateObject private var webOverlayManager: WebOverlayManager
+
+    init(surfaceView: Ghostty.SurfaceView) {
+        self.surfaceView = surfaceView
+        _webOverlayManager = StateObject(
+            wrappedValue: WebOverlayManager(surfaceView: surfaceView)
+        )
+    }
+
+    var body: some View {
+        ZStack {
+            // ... existing layers 0-12 ...
+
+            // Layer 13: Web Overlays (rendered via NSViewRepresentable)
+            WebOverlayContainerView(manager: webOverlayManager)
+                .allowsHitTesting(true)  // Overlays capture input
+        }
+        .environmentObject(webOverlayManager)
+    }
+}
+```
+
+#### API for Triggering Overlays
+
+**Option A: Escape Sequence Protocol (Shell Integration)**
+
+Define a new OSC sequence for web overlays:
+
+```
+OSC 1337 ; WebOverlay ; action=show ; row=R ; col=C ; html=<base64> ST
+OSC 1337 ; WebOverlay ; action=show ; row=R ; col=C ; url=<url> ST
+OSC 1337 ; WebOverlay ; action=dismiss ; id=<uuid> ST
+OSC 1337 ; WebOverlay ; action=dismissAll ST
+```
+
+**Changes Required:**
+1. Add parser handler in `src/terminal/Parser.zig`
+2. Add OSC handler in `src/termio/stream_handler.zig`
+3. Forward to apprt via message system
+4. Handle in Swift layer to create overlay
+
+**Option B: libghostty C API Extension**
+
+```c
+// In include/ghostty.h
+
+typedef struct {
+    int32_t row;
+    int32_t col;
+    const char* html;       // NULL if using url
+    const char* url;        // NULL if using html
+    int32_t width_cells;    // 0 for auto
+    int32_t height_cells;   // 0 for auto
+    bool dismiss_on_outside_click;
+    bool dismiss_on_scroll;
+} ghostty_web_overlay_config_s;
+
+typedef void* ghostty_web_overlay_t;
+
+ghostty_web_overlay_t ghostty_surface_show_web_overlay(
+    ghostty_surface_t surface,
+    const ghostty_web_overlay_config_s* config
+);
+
+void ghostty_surface_dismiss_web_overlay(
+    ghostty_surface_t surface,
+    ghostty_web_overlay_t overlay
+);
+
+void ghostty_surface_dismiss_all_web_overlays(ghostty_surface_t surface);
+```
+
+**Option C: Configuration-Driven (Regex Triggers)**
+
+Extend the existing link system:
+
+```
+# In ghostty config
+link = regex:https?://github\.com/[^/]+/[^/]+/pull/\d+ \
+       action:none \
+       hover:web-preview \
+       hover-url:https://ghpreview.example.com/?url=$0
+```
+
+This would automatically show a web preview when hovering over GitHub PR URLs.
+
+#### Focus and Event Handling
+
+**Challenge:** When a WebView overlay is visible, keyboard/mouse events need careful routing.
+
+```
+Event Flow with Overlays:
+
+Mouse Click
+    │
+    ▼
+┌─────────────────┐
+│ Hit Test:       │
+│ Is click in     │──── Yes ───▶ WebView handles event
+│ WebOverlay?     │             (links, scroll, etc.)
+└────────┬────────┘
+         │ No
+         ▼
+┌─────────────────┐
+│ Click outside   │──── dismissOnClickOutside? ───▶ Dismiss overlay
+│ overlay         │
+└────────┬────────┘
+         │
+         ▼
+   Terminal handles event
+   (selection, links, etc.)
+
+
+Keyboard Event
+    │
+    ▼
+┌─────────────────┐
+│ ESC key?        │──── dismissOnEscape? ───▶ Dismiss overlay
+└────────┬────────┘
+         │ No
+         ▼
+┌─────────────────┐
+│ capturesKeyboard│──── Yes ───▶ WebView handles event
+│ = true?         │
+└────────┬────────┘
+         │ No
+         ▼
+   Terminal handles event
+```
+
+**Implementation:**
+
+```swift
+// In WebOverlayView
+override func hitTest(_ point: NSPoint) -> NSView? {
+    // Only capture clicks if configured to do so
+    if config.capturesMouse {
+        let localPoint = convert(point, from: superview)
+        if bounds.contains(localPoint) {
+            return super.hitTest(point)
+        }
+    }
+    return nil  // Pass through to terminal
+}
+
+// Handle escape key to dismiss
+override func keyDown(with event: NSEvent) {
+    if event.keyCode == 53 && config.dismissOnEscape {  // ESC key
+        NotificationCenter.default.post(
+            name: .dismissWebOverlay,
+            object: config.id
+        )
+        return
+    }
+
+    if config.capturesKeyboard {
+        super.keyDown(with: event)
+    } else {
+        nextResponder?.keyDown(with: event)
+    }
+}
+```
+
+#### Scroll Synchronization
+
+When the terminal scrolls, overlays need to either:
+1. Move with the content (if attached to a specific row)
+2. Stay fixed (if attached to viewport)
+3. Dismiss (for tooltip-style overlays)
+
+```swift
+// In WebOverlayManager
+func handleScroll(newOffset: Int, oldOffset: Int) {
+    for (id, overlay) in overlays {
+        if overlay.config.dismissOnScroll {
+            dismiss(id)
+        } else {
+            // Reposition based on new scroll offset
+            overlay.positionOverlay()
+        }
+    }
+}
+```
+
+#### Complete Implementation Checklist
+
+| Component | Files | Effort |
+|-----------|-------|--------|
+| **WebOverlayView** | New Swift file | 2-3 days |
+| **WebOverlayManager** | New Swift file | 2-3 days |
+| **Position calculation** | Extend SurfaceView | 1-2 days |
+| **SwiftUI integration** | Modify SurfaceView.swift | 1 day |
+| **Event handling** | WebOverlayView | 2-3 days |
+| **Scroll sync** | SurfaceScrollView + Manager | 2-3 days |
+| **OSC protocol** | Parser + stream_handler | 3-5 days |
+| **C API bridge** | embedded.zig + ghostty.h | 2-3 days |
+| **Testing/polish** | Various | 3-5 days |
+| **Documentation** | Config docs, man pages | 1-2 days |
+
+**Total Estimated Effort:** 3-5 weeks for macOS implementation
+
+#### Security Considerations
+
+1. **Content Security Policy:** WebViews loading arbitrary HTML could execute malicious scripts
+   - Solution: Sandboxed WKWebView configuration
+   - Disable JavaScript for untrusted content
+   - Content-Security-Policy headers for loaded URLs
+
+2. **URL Validation:** Only allow specific URL patterns
+   - Whitelist trusted domains
+   - Block file:// URLs unless explicitly allowed
+
+3. **Resource Limits:** Prevent overlays from consuming excessive memory
+   - Limit number of concurrent overlays
+   - Auto-dismiss after timeout
+   - Monitor WebView memory usage
+
+---
+
 ### 6.2 Text Hovers/Highlights on Regex Patterns
 
 **Complexity: Low-Medium**
